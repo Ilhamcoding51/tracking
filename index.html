@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Face + Hand Tracking</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0f0f0f; color: #fff; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; min-height: 100vh; padding: 24px 16px; }
+  h1 { font-size: 20px; font-weight: 500; margin-bottom: 4px; }
+  p.sub { font-size: 13px; color: #888; margin-bottom: 20px; }
+  #container { position: relative; width: 100%; max-width: 640px; }
+  video { width: 100%; border-radius: 12px; display: block; transform: scaleX(-1); background: #1a1a1a; min-height: 360px; }
+  canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border-radius: 12px; transform: scaleX(-1); }
+  #stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 14px; width: 100%; max-width: 640px; }
+  .stat { background: #1e1e1e; border-radius: 10px; padding: 12px; text-align: center; }
+  .stat-label { font-size: 11px; color: #888; margin-bottom: 4px; }
+  .stat-val { font-size: 22px; font-weight: 500; }
+  .stat-val.green { color: #1D9E75; }
+  .stat-val.orange { color: #EF9F27; }
+  .stat-val.blue { color: #378ADD; }
+  #startBtn { margin-bottom: 16px; padding: 12px 32px; font-size: 15px; border-radius: 10px; border: none; background: #1D9E75; color: #fff; cursor: pointer; }
+  #startBtn:hover { background: #178c65; }
+  #startBtn:disabled { background: #444; cursor: default; }
+  #status { font-size: 13px; color: #888; margin-bottom: 12px; }
+  #finger-display { margin-top: 14px; width: 100%; max-width: 640px; background: #1e1e1e; border-radius: 10px; padding: 14px 18px; font-size: 14px; color: #aaa; min-height: 48px; }
+  #finger-display span { color: #fff; font-weight: 500; }
+</style>
+</head>
+<body>
+<h1>Face + Hand Tracking</h1>
+<p class="sub">Deteksi wajah, tangan, dan jumlah jari — MediaPipe</p>
+<button id="startBtn" onclick="startCamera()">Aktifkan Kamera</button>
+<p id="status">Tekan tombol untuk mulai</p>
+<div id="container">
+  <video id="videoEl" autoplay muted playsinline></video>
+  <canvas id="canvasEl"></canvas>
+</div>
+<div id="stats">
+  <div class="stat"><div class="stat-label">Wajah</div><div class="stat-val green" id="faceCount">0</div></div>
+  <div class="stat"><div class="stat-label">Tangan</div><div class="stat-val blue" id="handCount">0</div></div>
+  <div class="stat"><div class="stat-label">Total jari</div><div class="stat-val orange" id="fingerCount">0</div></div>
+  <div class="stat"><div class="stat-label">Confidence</div><div class="stat-val" id="conf">-</div></div>
+</div>
+<div id="finger-display">Arahkan tangan ke kamera untuk mendeteksi jari...</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/face_detection.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script>
+const video = document.getElementById('videoEl');
+const canvas = document.getElementById('canvasEl');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+
+let fdReady = false, handsReady = false;
+let lastFaceResults = null, lastHandResults = null;
+
+const FINGER_TIPS = [4, 8, 12, 16, 20];
+const FINGER_MIDS = [3, 6, 10, 14, 18];
+const FINGER_NAMES = ['Jempol', 'Telunjuk', 'Tengah', 'Manis', 'Kelingking'];
+
+const HAND_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],
+  [13,17],[17,18],[18,19],[19,20],
+  [0,17]
+];
+
+function countFingers(landmarks, handedness) {
+  const fingers = [];
+  const isRight = handedness === 'Right';
+
+  // Thumb: compare tip x vs mid x (mirrored)
+  const thumbTip = landmarks[4];
+  const thumbMid = landmarks[3];
+  const thumbBase = landmarks[2];
+  if (isRight) {
+    fingers.push(thumbTip.x < thumbMid.x ? 1 : 0);
+  } else {
+    fingers.push(thumbTip.x > thumbMid.x ? 1 : 0);
+  }
+
+  // Other 4 fingers: tip y < pip y = extended
+  for (let i = 1; i < 5; i++) {
+    const tip = landmarks[FINGER_TIPS[i]];
+    const pip = landmarks[FINGER_MIDS[i]];
+    fingers.push(tip.y < pip.y ? 1 : 0);
+  }
+  return fingers;
+}
+
+function drawHand(landmarks, handedness, W, H) {
+  // Skeleton
+  ctx.strokeStyle = '#378ADD';
+  ctx.lineWidth = 2;
+  HAND_CONNECTIONS.forEach(([a, b]) => {
+    ctx.beginPath();
+    ctx.moveTo(landmarks[a].x * W, landmarks[a].y * H);
+    ctx.lineTo(landmarks[b].x * W, landmarks[b].y * H);
+    ctx.stroke();
+  });
+
+  const fingers = countFingers(landmarks, handedness);
+
+  // Joints
+  landmarks.forEach((lm, i) => {
+    const isTip = FINGER_TIPS.includes(i);
+    const isUp = isTip && fingers[FINGER_TIPS.indexOf(i)] === 1;
+    ctx.beginPath();
+    ctx.arc(lm.x * W, lm.y * H, isTip ? 6 : 4, 0, Math.PI * 2);
+    ctx.fillStyle = isUp ? '#EF9F27' : '#378ADD';
+    ctx.fill();
+  });
+
+  return fingers;
+}
+
+function render() {
+  const W = canvas.width;
+  const H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  let totalFingers = 0;
+  let handCount = 0;
+  let fingerDisplay = [];
+
+  // Draw faces
+  let faceConf = '-';
+  if (lastFaceResults) {
+    const faces = lastFaceResults.detections || [];
+    document.getElementById('faceCount').textContent = faces.length;
+    faces.forEach(det => {
+      const box = det.boundingBox;
+      const score = det.score ? det.score[0] : null;
+      const conf = score != null ? Math.round(score * 100) : '?';
+      faceConf = conf + '%';
+      const x = box.xCenter * W - (box.width * W) / 2;
+      const y = box.yCenter * H - (box.height * H) / 2;
+      const w = box.width * W;
+      const h = box.height * H;
+      ctx.strokeStyle = '#1D9E75';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.roundRect(x, y, w, h, 8);
+      ctx.stroke();
+      ctx.fillStyle = '#1D9E75';
+      ctx.fillRect(x, y - 24, 95, 22);
+      ctx.fillStyle = '#fff';
+      ctx.font = '500 13px sans-serif';
+      ctx.fillText('Wajah ' + conf + '%', x + 6, y - 7);
+      (det.keypoints || []).forEach(kp => {
+        ctx.beginPath();
+        ctx.arc(kp.x * W, kp.y * H, 3, 0, Math.PI * 2);
+        ctx.fillStyle = '#D85A30';
+        ctx.fill();
+      });
+    });
+  }
+
+  // Draw hands
+  if (lastHandResults) {
+    const multi = lastHandResults.multiHandLandmarks || [];
+    const multiHandedness = lastHandResults.multiHandedness || [];
+    handCount = multi.length;
+    document.getElementById('handCount').textContent = handCount;
+
+    multi.forEach((landmarks, i) => {
+      const label = multiHandedness[i] ? multiHandedness[i].label : 'Right';
+      const fingers = drawHand(landmarks, label, W, H);
+      const count = fingers.reduce((a, b) => a + b, 0);
+      totalFingers += count;
+
+      const upNames = FINGER_NAMES.filter((_, idx) => fingers[idx] === 1);
+      fingerDisplay.push(`<span>${label === 'Right' ? 'Kanan' : 'Kiri'}:</span> ${count} jari (${upNames.join(', ') || 'tidak ada'})`);
+
+      // Label on hand
+      const wrist = landmarks[0];
+      ctx.fillStyle = '#378ADD';
+      ctx.fillRect(wrist.x * W - 10, wrist.y * H + 8, 80, 20);
+      ctx.fillStyle = '#fff';
+      ctx.font = '500 12px sans-serif';
+      ctx.fillText((label === 'Right' ? 'Kanan' : 'Kiri') + ': ' + count, wrist.x * W - 6, wrist.y * H + 22);
+    });
+  }
+
+  document.getElementById('fingerCount').textContent = totalFingers;
+  document.getElementById('conf').textContent = faceConf;
+  document.getElementById('finger-display').innerHTML =
+    fingerDisplay.length ? fingerDisplay.join('<br>') : 'Arahkan tangan ke kamera untuk mendeteksi jari...';
+}
+
+async function startCamera() {
+  document.getElementById('startBtn').disabled = true;
+  statusEl.textContent = 'Memuat model...';
+
+  const fd = new FaceDetection({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${f}` });
+  fd.setOptions({ model: 'short', minDetectionConfidence: 0.5 });
+  fd.onResults(r => { lastFaceResults = r; render(); });
+
+  const hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+  hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+  hands.onResults(r => { lastHandResults = r; render(); });
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+    video.srcObject = stream;
+    await video.play();
+    statusEl.textContent = 'Aktif — arahkan wajah & tangan ke kamera';
+    document.getElementById('startBtn').style.display = 'none';
+
+    async function loop() {
+      canvas.width = video.videoWidth || 640;
+      canvas.height = video.videoHeight || 480;
+      await fd.send({ image: video });
+      await hands.send({ image: video });
+      requestAnimationFrame(loop);
+    }
+    loop();
+  } catch(e) {
+    statusEl.textContent = 'Error: ' + e.message;
+    document.getElementById('startBtn').disabled = false;
+  }
+}
+</script>
+</body>
+</html>
